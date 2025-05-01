@@ -1,226 +1,260 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <math.h>
 #include <curand_kernel.h>
-#include <cublas_v2.h>
+#include <cuda_runtime.h>
 #include <helper_cuda.h>
-#include <cuda_profiler_api.h>
 
-// Constants
-#define NUM_PATHS 100000    // Monte Carlo paths
-#define N_STEPS 365         // Time steps
-#define GRID_SIZE 100       // Quantization grid size
-#define BLOCK_SIZE 256      // Threads per block
-#define BASIS_DEGREE 3      // LSM regression polynomial degree
+#define CALL        true
+#define PUT         false
+#define MAX_STEPS   366
+#define MAX_DIM     2
+#define MAX_GRID    500
 
-// Financial parameters (American put option)
-const float S0 = 100.0;     // Initial stock price
-const float K = 100.0;      // Strike price
-const float r = 0.05;       // Risk-free rate
-const float sigma = 0.2;    // Volatility
-const float dt = 1.0/365.0; // Time step
+typedef struct {
+    // Simulation control
+    int M_PATHS;       // Number of Monte Carlo paths
+    int N_STEPS;       // Number of time steps
+    float T;           // Maturity (in years)
+    float dT;          // Time step size = T / N_STEPS
 
-// GPU Arrays
-float *d_lsm_paths;         // LSM asset paths (NUM_PATHS x N_STEPS)
-float *d_quant_grids;       // Quantization grids (N_STEPS x GRID_SIZE)
-int *d_transitions_ii;      // Algorithm II transitions (N_STEPS x GRID_SIZE x GRID_SIZE)
-int *d_transitions_iii;     // Algorithm III transitions (N_STEPS x GRID_SIZE x GRID_SIZE)
-float *d_A, *d_T;           // AR(1) coefficients
+    // Option parameters
+    float S0;          // Initial asset price
+    float K;           // Strike price
+    float r;           // Risk-free rate
+    int Q_min, Q_max;  // Min and max exercise rights
 
-// CURAND states and cuBLAS handle
-curandState *d_states;
-cublasHandle_t cublas_handle;
+    // Longstaff-Schwartz
+    int N_BASIS;       // Number of basis functions for regression
 
-// Error checking macro
-#define CHECK_CUDA(call) { \
-    cudaError_t err = call; \
-    if (err != cudaSuccess) { \
-        fprintf(stderr, "CUDA Error at %s:%d - %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
-        exit(EXIT_FAILURE); \
-    } \
+    // Quantization
+    int N_GRID;        // Number of grid points per time step
+    int N_DIM;         // State space dimensionality (1 for GBM, 2 for OU)
+
+    // Random number generation
+    unsigned long RNG_SEED;
+
+    // AR(1) 
+    float alpha1;
+    float alpha2;
+    float sigma1;
+    float sigma2;
+} SimulationParams;
+
+typedef struct {
+    float X0[MAX_DIM];                          // Initial state
+    float A[MAX_STEPS][MAX_DIM][MAX_DIM];       // A_k transition matrices
+    float Tmat[MAX_STEPS][MAX_DIM][MAX_DIM];    // T_k volatility matrices
+} AR1ModelParams;
+
+
+void run_options_pipeline(SimulationParams *sim, AR1ModelParams *ar1) {
+    // init_parameters();
+    // allocate_memory();
+
+    // generate_quantization_grids();  // Shared between TQ-II and TQ-III
+
+    // // Monte Carlo simulation
+    // simulate_paths();  // For LSM (used directly), for TQ (used for transition estimation)
+
+    // // Run Longstaff-Schwartz
+    // V_LSM = price_LSM();
+
+    // // Run Tree Quantization Algorithm II
+    // estimate_transition_probabilities_algo2();
+    // V_TQ2 = backward_induction_quantized();
+
+    // // Run Tree Quantization Algorithm III
+    // estimate_transition_probabilities_algo3();
+    // V_TQ3 = backward_induction_quantized();
+
+    // print_results(V_LSM, V_TQ2, V_TQ3);
+    // compare_performance();
+    // cleanup();
 }
 
-__global__ void initCurandStates(curandState *states, unsigned long seed) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= NUM_PATHS) return;
-    curand_init(seed + idx, 0, 0, &states[idx]);
+
+void printUsage(char *prog) {
+    printf("Usage: %s [OPTIONS]\n", prog);
+    printf("Options:                                defaults:\n");
+    printf("  -m  Number of Monte Carlo samples  -  100000\n");
+    printf("  -n  Number of time steps - - - - - -  365\n");
+    printf("  -g  Grid size per time step  - - - -  250\n");
+    printf("  -t  Time (years) to maturity - - - -  1.0\n");
+    printf("  -s  Initial stock price  - - - - - -  100.0\n");
+    printf("  -k  Strike price - - - - - - - - - -  100.0\n");
+    printf("  -r  Risk-free rate - - - - - - - - -  0.05\n");
+    printf("  -q  Minimum quantity - - - - - - - -  50\n");
+    printf("  -Q  Maximum quantity - - - - - - - -  150\n");
+    printf("  -S  Random number generator seed - -  42\n");
+
+    printf("Put the following options last:\n");
+    printf("  -a1 First Gaussian weight alpha1 - -  1.0\n");
+    printf("  -a2 Second Gaussian weight alpha2  -  0.4\n");
+    printf("  -s1 First Gaussian sigma1  - - - - -  0.3\n");
+    printf("  -s2 Second Gaussian sigma2 - - - - -  0.2\n");
 }
 
-//--------------------------------------------------------------
-// Longstaff-Schwartz (LSM) Kernels
-//--------------------------------------------------------------
-__global__ void generateLSMPaths(float *d_paths, curandState *states) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= NUM_PATHS) return;
-
-    curandState localState = states[idx];
-    float S = S0;
-    for (int t = 0; t < N_STEPS; t++) {
-        float epsilon = curand_normal(&localState);
-        S *= exp((r - 0.5*sigma*sigma)*dt + sigma*sqrt(dt)*epsilon);
-        d_paths[idx * N_STEPS + t] = S;
-    }
-    states[idx] = localState;
+void printSimulationParams(SimulationParams *sim) {
+    printf("Model parameters:\n");
+    printf("  Number of Monte Carlo samples  -  %d\n", sim->M_PATHS);
+    printf("  Number of time steps - - - - - -  %d\n", sim->N_STEPS);
+    printf("  Grid size per time step  - - - -  %d\n", sim->N_GRID);
+    printf("  Time (years) to maturity - - - -  %.4f\n", sim->T);
+    printf("  Initial stock price  - - - - - -  %.4f\n", sim->S0);
+    printf("  Strike price - - - - - - - - - -  %.4f\n", sim->K);
+    printf("  Risk-free rate - - - - - - - - -  %.4f\n", sim->r);
+    printf("  Minimum quantity - - - - - - - -  %d\n", sim->Q_min);
+    printf("  Maximum quantity - - - - - - - -  %d\n", sim->Q_max);
+    printf("  Random number generator seed - -  %lu\n", sim->RNG_SEED);
+    printf("  First Gaussian weight alpha1 - -  %.4f\n", sim->alpha1);
+    printf("  Second Gaussian weight alpha2  -  %.4f\n", sim->alpha2);
+    printf("  First Gaussian sigma1  - - - - -  %.4f\n", sim->sigma1);
+    printf("  Second Gaussian sigma2 - - - - -  %.4f\n", sim->sigma2);
 }
 
-__global__ void lsmBackwardRegression(float *d_paths, float *d_values, int step) {
-    extern __shared__ float s_data[]; // Shared memory for regression
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= NUM_PATHS) return;
-
-    // In-the-money check and basis functions (simplified)
-    float S = d_paths[idx * N_STEPS + step];
-    if (S >= K) return;
-
-    // Basis functions (polynomial terms)
-    float basis[BASIS_DEGREE + 1];
-    for (int i = 0; i <= BASIS_DEGREE; i++) 
-        basis[i] = powf(S, i);
-
-    // Regression logic (use global memory for matrix)
-    // ... (cuBLAS integration required for actual regression)
-}
-
-//--------------------------------------------------------------
-// Quantization Tree Algorithm II (Pathwise processing)
-//--------------------------------------------------------------
-__global__ void quantTreeII(float *grids, int *transitions, curandState *states) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= NUM_PATHS) return;
-
-    curandState localState = states[idx];
-    float x = S0; // Initial state
-    int prev_idx = 0;
-
-    for (int k = 1; k < N_STEPS; k++) {
-        // Simulate AR(1) process
-        float epsilon = curand_normal(&localState);
-        x = 0.9 * x + 0.1 * epsilon; // Example coefficients
-
-        // Brute-force nearest neighbor search
-        float min_dist = INFINITY;
-        int curr_idx = 0;
-        for (int i = 0; i < GRID_SIZE; i++) {
-            float dist = fabs(x - grids[k * GRID_SIZE + i]);
-            if (dist < min_dist) {
-                min_dist = dist;
-                curr_idx = i;
-            }
-        }
-
-        // Atomic update
-        atomicAdd(&transitions[(k-1) * GRID_SIZE * GRID_SIZE + prev_idx * GRID_SIZE + curr_idx], 1);
-        prev_idx = curr_idx;
-    }
-}
-
-//--------------------------------------------------------------
-// Quantization Tree Algorithm III (Time-layer parallelism)
-//--------------------------------------------------------------
-__global__ void quantTreeIII(float *grids, int *transitions, curandState *states) {
-    __shared__ float s_grid_current[GRID_SIZE];
-    __shared__ float s_grid_next[GRID_SIZE];
-    int k = blockIdx.y; // Time layer index
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= NUM_PATHS || k >= N_STEPS-1) return;
-
-    // Load grids to shared memory
-    if (threadIdx.x < GRID_SIZE) {
-        s_grid_current[threadIdx.x] = grids[k * GRID_SIZE + threadIdx.x];
-        s_grid_next[threadIdx.x] = grids[(k+1) * GRID_SIZE + threadIdx.x];
-    }
-    __syncthreads();
-
-    // Simulate AR(1) process
-    curandState localState = states[idx * N_STEPS + k];
-    float x = 0.9 * s_grid_current[threadIdx.x % GRID_SIZE] + 0.1 * curand_normal(&localState);
-
-    // Nearest neighbor searches
-    int i = 0, j = 0;
-    float min_dist_current = INFINITY, min_dist_next = INFINITY;
-    for (int idx_grid = 0; idx_grid < GRID_SIZE; idx_grid++) {
-        float dist_current = fabs(x - s_grid_current[idx_grid]);
-        float dist_next = fabs(x - s_grid_next[idx_grid]);
-        if (dist_current < min_dist_current) { i = idx_grid; min_dist_current = dist_current; }
-        if (dist_next < min_dist_next) { j = idx_grid; min_dist_next = dist_next; }
-    }
-
-    atomicAdd(&transitions[k * GRID_SIZE * GRID_SIZE + i * GRID_SIZE + j], 1);
-}
-
-//--------------------------------------------------------------
-// Host Functions
-//--------------------------------------------------------------
-void initQuantGrids(float *h_grids) {
-    for (int k = 0; k < N_STEPS; k++) {
-        float min_val = S0 * exp(-3 * sigma * sqrt(k*dt));
-        float max_val = S0 * exp(3 * sigma * sqrt(k*dt));
-        float step = (max_val - min_val) / (GRID_SIZE - 1);
-        for (int i = 0; i < GRID_SIZE; i++) 
-            h_grids[k * GRID_SIZE + i] = min_val + i * step;
-    }
-}
-
-void precomputeAR1Coeffs(float *h_A, float *h_T) {
-    for (int k = 0; k < N_STEPS; k++) {
-        h_A[k] = exp(-0.1 * dt); // Example AR(1) coefficient
-        h_T[k] = sigma * sqrt((1 - exp(-2*0.1*dt))/(2*0.1));
-    }
-}
-
-int main() {
-    // Initialize host/device memory
-    float *h_grids = (float*)malloc(N_STEPS * GRID_SIZE * sizeof(float));
-    float *h_A = (float*)malloc(N_STEPS * sizeof(float));
-    float *h_T = (float*)malloc(N_STEPS * sizeof(float));
-    initQuantGrids(h_grids);
-    precomputeAR1Coeffs(h_A, h_T);
-
-    // Allocate device memory
-    CHECK_CUDA(cudaMalloc(&d_lsm_paths, NUM_PATHS * N_STEPS * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_quant_grids, N_STEPS * GRID_SIZE * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_transitions_ii, (N_STEPS-1) * GRID_SIZE * GRID_SIZE * sizeof(int)));
-    CHECK_CUDA(cudaMalloc(&d_transitions_iii, (N_STEPS-1) * GRID_SIZE * GRID_SIZE * sizeof(int)));
-    CHECK_CUDA(cudaMemcpy(d_quant_grids, h_grids, N_STEPS * GRID_SIZE * sizeof(float), cudaMemcpyHostToDevice));
-
-    // Initialize CURAND
-    CHECK_CUDA(cudaMalloc(&d_states, NUM_PATHS * sizeof(curandState)));
-    dim3 block(BLOCK_SIZE);
-    dim3 grid((NUM_PATHS + BLOCK_SIZE - 1) / BLOCK_SIZE);
-
-    unsigned long seed = time(NULL); // Use current time as base seed
-    initCurandStates<<<grid, block>>>(d_states, seed);
-    CHECK_CUDA(cudaDeviceSynchronize()); // Ensure initialization completes
-
-    // Initialize cuBLAS
-    cublasCreate(&cublas_handle);
-
-    // Allocate regression memory
-    float *d_X, *d_Y, *d_beta;
-    CHECK_CUDA(cudaMalloc(&d_X, NUM_PATHS * (BASIS_DEGREE + 1) * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_Y, NUM_PATHS * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_beta, (BASIS_DEGREE + 1) * sizeof(float)));
+void init_SimulationParams(SimulationParams *sim) {
     
-    // Backward pass loop
-    for (int t = N_STEPS - 2; t >= 0; t--) {
-        constructBasisMatrix<<<grid, block>>>(d_X, d_paths, t);
-        lsmRegression(cublas_handle, d_X, d_Y, d_beta, NUM_PATHS);
-        lsmBackwardRegression<<<grid, block>>>(d_paths, d_values, t, d_beta);
+    sim->M_PATHS = 100000;
+    sim->N_STEPS = 365;
+    sim->T = 1.0f;
+    sim->dT = 1.0f / 365;
+    sim->S0 = 100.0f;
+    sim->K = 100.0f;
+    sim->r = 0.05f;
+    sim->Q_min = 50;
+    sim->Q_max = 150;
+    sim->N_BASIS = 3;
+    sim->N_GRID = 250;
+    sim->N_DIM = 2;
+    sim->RNG_SEED = 42UL;
+    sim->alpha1 = 1.0f;
+    sim->alpha2 = 0.4f;
+    sim->sigma1 = 0.3f;
+    sim->sigma2 = 0.2f;
+}
+
+void init_AR1ModelParams(AR1ModelParams *ar1, SimulationParams *sim) {
+    for (int d = 0; d < MAX_DIM; d++) {
+        ar1->X0[d] = 0.0f;
     }
 
-    cublasDestroy(cublas_handle);
-    CHECK_CUDA(cudaFree(d_X));
-    CHECK_CUDA(cudaFree(d_Y));
-    CHECK_CUDA(cudaFree(d_beta));
+    const float dT = sim->dT;
+    const float alpha1 = sim->alpha1, alpha2 = sim->alpha2;
+    const float sigma1 = sim->sigma1, sigma2 = sim->sigma2;
+    const int n_steps = sim->N_STEPS;
 
-    // Run Quantization Trees
-    quantTreeII<<<grid, block>>>(d_quant_grids, d_transitions_ii, d_states);
-    dim3 grid_iii((NUM_PATHS + BLOCK_SIZE - 1)/BLOCK_SIZE, N_STEPS-1);
-    quantTreeIII<<<grid_iii, block>>>(d_quant_grids, d_transitions_iii, d_states);
+    for (int k = 0; k < n_steps; k++) {
+        float e1 = expf(-alpha1 * dT);
+        float e2 = expf(-alpha2 * dT);
 
-    // Cleanup
-    CHECK_CUDA(cudaFree(d_lsm_paths));
-    CHECK_CUDA(cudaFree(d_quant_grids));
-    free(h_grids);
-    return 0;
+        // A_k = diag(e1, e2)
+        ar1->A[k][0][0] = e1;
+        ar1->A[k][0][1] = 0.0f;
+        ar1->A[k][1][0] = 0.0f;
+        ar1->A[k][1][1] = e2;
+
+        // T_k = sqrt(Var) = diag(sigma_i * sqrt((1 - e^{-2*alpha_i*delta_t}) / (2*alpha_i)))
+        float var1 = sigma1 * sqrtf((1 - expf(-2.0f * alpha1 * dT)) / (2.0f * alpha1));
+        float var2 = sigma2 * sqrtf((1 - expf(-2.0f * alpha2 * dT)) / (2.0f * alpha2));
+
+        ar1->Tmat[k][0][0] = var1;
+        ar1->Tmat[k][0][1] = 0.0f;
+        ar1->Tmat[k][1][0] = 0.0f;
+        ar1->Tmat[k][1][1] = var2;
+    }
+}
+
+
+int main(int argc, char **argv) {
+    SimulationParams *sim = (SimulationParams*) malloc(sizeof(SimulationParams));
+    init_SimulationParams(sim);
+
+    int opt;
+    int val_i;
+    float val_f;
+    unsigned long val_ul;
+    while ((opt = getopt(argc, argv, "m:n:g:t:s:k:r:q:Q:S:")) != -1) {
+        switch (opt) {
+            case 'm':
+                val_i = atoi(optarg);
+                if (val_i > 0) sim->M_PATHS = val_i; 
+                break;
+            case 'n':             
+                val_i = atoi(optarg);
+                if (val_i > 0 && val_i < MAX_STEPS) sim->N_STEPS = val_i; 
+                break;
+            case 'g': 
+                val_i = atoi(optarg);
+                if (val_i > 0 && val_i < MAX_GRID) sim->N_GRID = val_i; 
+                break;
+            case 't':
+                val_f = atof(optarg);
+                if (val_f > 0.0f) sim->T = val_f; 
+                break;
+            case 's':
+                val_f = atof(optarg);
+                if (val_f > 0.0f) sim->S0 = val_f; 
+                break;
+            case 'k':
+                val_f = atof(optarg);
+                if (val_f > 0.0f) sim->K = val_f; 
+                break;
+            case 'r':
+                val_f = atof(optarg);
+                if (val_f > 0.0f) sim->r = val_f; 
+                break;
+            case 'q':
+                val_i = atoi(optarg);
+                if (val_i > 0) sim->Q_min = val_i; 
+                break;
+            case 'Q':
+                val_i = atoi(optarg);
+                if (val_i > 0) sim->Q_max = val_i; 
+                break;
+            case 'S':
+                val_ul = strtoul(optarg, NULL, 10);
+                if (val_ul > 0UL) sim->RNG_SEED = val_ul;
+                break;
+            default:
+                printUsage(argv[0]);
+                free(sim);
+                exit(EXIT_FAILURE);
+        }
+    }
+
+    for (int i = optind; i < argc; i++) {
+        bool param_idx_valid = i + 1 < argc;
+        if (!strcmp(argv[i], "-a1") && param_idx_valid) {
+            sim->alpha1 = atof(argv[++i]);
+        } else if (!strcmp(argv[i], "-a2") && param_idx_valid) {
+            sim->alpha2 = atof(argv[++i]);
+        } else if (!strcmp(argv[i], "-s1") && param_idx_valid) {
+            sim->sigma1 = atof(argv[++i]);
+        } else if (!strcmp(argv[i], "-s2") && param_idx_valid) {
+            sim->sigma2 = atof(argv[++i]);
+        } else {
+            fprintf(stderr, "Unknown or incomplete argument: %s\n", argv[i]);
+            printUsage(argv[0]);
+            free(sim);
+            exit(EXIT_FAILURE);
+        }
+    }
+
+
+    // #define MAX_STEPS   366
+    // #define MAX_GRID    500
+
+
+    AR1ModelParams *ar1 = (AR1ModelParams*) malloc(sizeof(AR1ModelParams));
+    init_AR1ModelParams(ar1, sim);
+
+    printSimulationParams(sim);
+
+    run_options_pipeline(sim, ar1);
+
+    free(sim);
+    free(ar1);
+    return EXIT_SUCCESS;
 }
