@@ -127,7 +127,7 @@ __global__ void init_rng_kernel(curandState *states, unsigned long seed, int M) 
 
 __global__ void simulate_paths_kernel(
     float *d_paths,
-    const AR1ModelParams *ar1,
+    const AR1ModelParams *d_ar1,
     curandState *d_rng_states,
     const int M_PATHS,
     const int N_STEPS
@@ -141,7 +141,7 @@ __global__ void simulate_paths_kernel(
 
     // load initial state
     for (int d = 0; d < N_DIM; d++) {
-        X_curr[d] = ar1->X0[d];
+        X_curr[d] = d_ar1->X0[d];
         d_paths[(d * N_STEPS + 0) * M_PATHS + tid] = X_curr[d];
     }
 
@@ -157,10 +157,10 @@ __global__ void simulate_paths_kernel(
         for (int i = 0; i < N_DIM; i++) {
             float sum = 0.0f;
             for (int j = 0; j < N_DIM; j++) {
-                sum += ar1->A[k][i][j] * X_curr[j];
+                sum += d_ar1->A[k][i][j] * X_curr[j];
             }
             for (int j = 0; j < N_DIM; j++) {
-                sum += ar1->Tmat[k][i][j] * Z[j];
+                sum += d_ar1->Tmat[k][i][j] * Z[j];
             }
             X_next[i] = sum;
         }
@@ -174,7 +174,7 @@ __global__ void simulate_paths_kernel(
     d_rng_states[tid] = local_state;
 }
 
-void generate_quantization_grids(const SimulationParams *sim, const AR1ModelParams *ar1, float *h_Gamma) {
+void generate_quantization_grids(const SimulationParams *sim, const AR1ModelParams *h_ar1, float *h_Gamma) {
     for (int k = 0; k < sim->N_STEPS; k++) {
         float x_std[2];
 
@@ -182,7 +182,7 @@ void generate_quantization_grids(const SimulationParams *sim, const AR1ModelPara
             // std deviation assuming mean 0
             float var = 0.0f;
             for (int j = 0; j < 2; j++) {
-                var += ar1->Tmat[k][d][j] * ar1->Tmat[k][d][j];
+                var += h_ar1->Tmat[k][d][j] * h_ar1->Tmat[k][d][j];
             }
             x_std[d] = sqrtf(var);
         }
@@ -207,7 +207,7 @@ void generate_quantization_grids(const SimulationParams *sim, const AR1ModelPara
     }
 }
   
-void run_options_pipeline(const SimulationParams *sim, const AR1ModelParams *ar1) {
+void run_options_pipeline(const SimulationParams *sim, const AR1ModelParams *h_ar1) {
 // memory allocation
     const int m_paths = sim->M_PATHS;
     const int n_steps = sim->N_STEPS;
@@ -227,6 +227,7 @@ void run_options_pipeline(const SimulationParams *sim, const AR1ModelParams *ar1
     checkCudaErrors(cudaMallocHost(&h_Gamma, gamma_bytes));
 
     // device
+    AR1ModelParams *d_ar1 = NULL;
     float *d_paths = NULL;
     float *d_V = NULL;
     float *d_Gamma = NULL;
@@ -234,6 +235,9 @@ void run_options_pipeline(const SimulationParams *sim, const AR1ModelParams *ar1
     int *d_pkij = NULL;
     int *d_pki = NULL;
     curandState *d_rng_states = NULL;
+
+    checkCudaErrors(cudaMalloc(&d_ar1, sizeof(AR1ModelParams)));                // ar1 params for device
+    cudaMemcpy(d_ar1, h_ar1, sizeof(AR1ModelParams), cudaMemcpyHostToDevice);
 
     checkCudaErrors(cudaMalloc(&d_paths, path_bytes));      // simulation paths
     checkCudaErrors(cudaMalloc(&d_V, V_bytes));             // value vector
@@ -249,7 +253,7 @@ void run_options_pipeline(const SimulationParams *sim, const AR1ModelParams *ar1
     checkCudaErrors(cudaMalloc(&d_rng_states, sizeof(curandState) * m_paths));      // RNG states
 
 // init quatization grid
-    generate_quantization_grids(sim, ar1, h_Gamma);
+    generate_quantization_grids(sim, h_ar1, h_Gamma);
     cudaMemcpy(d_Gamma, h_Gamma, gamma_bytes, cudaMemcpyHostToDevice);
 
     dim3 block(256);
@@ -261,7 +265,7 @@ void run_options_pipeline(const SimulationParams *sim, const AR1ModelParams *ar1
 
 // Monte Carlo simulation
     simulate_paths_kernel<<<grid, block>>>(
-        d_paths, ar1, d_rng_states, m_paths, n_steps
+        d_paths, d_ar1, d_rng_states, m_paths, n_steps
     );
     checkCudaErrors(cudaDeviceSynchronize());
 
