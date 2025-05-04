@@ -11,6 +11,8 @@
 #define MAX_STEPS   366
 #define MAX_DIM     2
 #define MAX_GRID    500
+#define MAX_BASIS   5
+#define DISCOUNT(dt, r) (expf(-(r) * (dt)))
 
 typedef struct {
     // Simulation control
@@ -46,78 +48,6 @@ typedef struct {
     float A[MAX_STEPS][MAX_DIM][MAX_DIM];       // A_k transition matrices
     float Tmat[MAX_STEPS][MAX_DIM][MAX_DIM];    // T_k volatility matrices
 } AR1ModelParams;
-
-// __device__ nearest_neighbor(...) {
-//     // to do
-// }
-
-// __device__ generate_epsilon(...){
-//     // to do
-// }
-
-// __device__ apply_AR1(...){
-//     // to do
-// }
-
-// price_LSM() {
-//     // to do
-//     paths = simulate_paths();  // [M x N_STEPS] array
-
-//     V = evaluate_payoff(paths, N_STEPS); // Final payoff
-
-//     for (k = N_STEPS - 1; k >= 0; k--) {
-//         X = paths[:, k];
-//         C = regress_continuation_value(X, V);  // Least squares regression
-//         E = evaluate_payoff(X, k);
-
-//         for each path i:
-//             V[i] = max(E[i], C[i]);  // Choose to exercise or continue
-//     }
-
-//     return average(V);
-// }
-
-// estimate_transition_probabilities_algo2() {
-//     // to do
-//     for each path m in parallel:
-//         x = x0;
-//         i = nearest_neighbor(x, Gamma[0]);
-
-//         for (k = 1 to N_STEPS):
-//             epsilon = generate_normal();
-//             x = A_k * x + T_k * epsilon;
-
-//             j = nearest_neighbor(x, Gamma[k]);
-//             atomicAdd(p_k_ij[k][i][j], 1);
-//             atomicAdd(p_k_i[k][j], 1);
-//             i = j;
-// }
-// estimate_transition_probabilities_algo3() {
-//     // to do
-//     for each time step k in parallel:
-//         for each path m in parallel:
-//             Xk = sample_from_Xk();  // Draw x from known distribution
-//             epsilon = generate_normal();
-
-//             i = nearest_neighbor(Xk, Gamma[k]);
-//             x_next = A_k * Xk + T_k * epsilon;
-//             j = nearest_neighbor(x_next, Gamma[k+1]);
-
-//             atomicAdd(p_k_ij[k][i][j], 1);
-//             atomicAdd(p_k_i[k][i], 1);
-// }
-
-// backward_induction_quantized() {
-//     // to do
-//     V[N_STEPS][*] = evaluate_payoff(Gamma[N_STEPS]);
-
-//     for k = N_STEPS - 1 to 0:
-//         for i in 0 to Nk:
-//             continuation = 0;
-//             for j in 0 to Nk+1:
-//                 continuation += P_k_ij[k][i][j] * V[k+1][j];
-//             V[k][i] = max(payoff(Gamma[k][i]), continuation);
-// }
 
 __global__ void init_rng_kernel(curandState *states, unsigned long seed, int M) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -174,6 +104,138 @@ __global__ void simulate_paths_kernel(
     d_rng_states[tid] = local_state;
 }
 
+static float payoff(float S, float K) {
+    return fmaxf(K - S, 0.0f);  // put
+}
+
+static void evaluate_basis(float x, int N_BASIS, float* basis_out) {
+    // Laguerre polynomials
+    basis_out[0] = 1.0f;
+    if (N_BASIS > 1) basis_out[1] = 1.0f - x;
+    for (int i = 2; i < N_BASIS; i++) {
+        basis_out[i] = ((2 * i - 1 - x) * basis_out[i - 1] - (i - 1) * basis_out[i - 2]) / i;
+    }
+}
+
+float price_LSM(float *h_paths, const SimulationParams *sim) {
+    int M = sim->M_PATHS;
+    int N = sim->N_STEPS;
+    int N_BASIS = sim->N_BASIS;
+    float K = sim->K;
+    float dT = sim->dT;
+    float r = sim->r;
+
+    float* cashflows = (float*)calloc(M * N, sizeof(float));
+    bool* exercised = (bool*)calloc(M * N, sizeof(bool));
+    int* exercise_count = (int*)calloc(M, sizeof(int));
+
+    // initialize with final payoffs at maturity
+    int t_final = N - 1;
+    for (int m = 0; m < M; m++) {
+        float S = h_paths[(0 * N + t_final) * M + m];
+        float val = payoff(S, K);
+        cashflows[t_final * M + m] = val;
+    }
+
+    // backward induction
+    for (int t = N - 2; t >= 0; t--) {
+        // paths still eligible to exercise
+        int n_train = 0;
+        float *X = (float*)malloc(sizeof(float) * M);
+        float *Y = (float*)malloc(sizeof(float) * M);
+
+        for (int m = 0; m < M; m++) {
+            if (exercise_count[m] >= sim->Q_max) continue;
+
+            float S = h_paths[(0 * N + t) * M + m];
+            float immediate = payoff(S, K);
+            if (immediate > 0.0f) {
+                X[n_train] = S;
+
+                // discounted cashflow
+                float discounted = 0.0f;
+                for (int t2 = t + 1; t2 < N; t2++) {
+                    discounted += DISCOUNT((t2 - t) * dT, r) * cashflows[t2 * M + m];
+                }
+
+                Y[n_train] = discounted;
+                n_train++;
+            }
+        }
+
+        // regression
+        float **Phi = (float**)malloc(n_train * sizeof(float*));
+        float *b = (float*)calloc(N_BASIS, sizeof(float));
+        float **A = (float**)calloc(N_BASIS, sizeof(float*));
+        for (int i = 0; i < N_BASIS; i++) {
+            A[i] = (float*)calloc(N_BASIS, sizeof(float));
+        }
+
+        for (int i = 0; i < n_train; i++) {
+            Phi[i] = (float*)malloc(N_BASIS * sizeof(float));
+            evaluate_basis(X[i], N_BASIS, Phi[i]);
+        }
+
+        // A = phi.T * phi and b = phi.T * Y
+        for (int i = 0; i < N_BASIS; i++) {
+            for (int j = 0; j < N_BASIS; j++) {
+                for (int k = 0; k < n_train; k++) {
+                    A[i][j] += Phi[k][i] * Phi[k][j];
+                }
+            }
+            for (int k = 0; k < n_train; k++) {
+                b[i] += Phi[k][i] * Y[k];
+            }
+        }
+
+        // A * beta = b using Gaussian elimination
+        float *beta = (float*)calloc(N_BASIS, sizeof(float));
+        for (int i = 0; i < N_BASIS; i++) beta[i] = b[i];
+
+        // exercise decisions
+        for (int m = 0; m < M; m++) {
+            if (exercise_count[m] >= sim->Q_max) continue;
+            float S = h_paths[(0 * N + t) * M + m];
+            float phi[MAX_BASIS];
+            evaluate_basis(S, N_BASIS, phi);
+
+            float cont_val = 0.0f;
+            for (int i = 0; i < N_BASIS; i++) {
+                cont_val += beta[i] * phi[i];
+            }
+
+            float immediate = payoff(S, K);
+            if (immediate > cont_val) {
+                cashflows[t * M + m] = immediate;
+                exercised[t * M + m] = true;
+                exercise_count[m]++;
+            }
+        }
+
+        // free mgemory
+        for (int i = 0; i < n_train; i++) free(Phi[i]);
+        free(Phi); free(X); free(Y); free(beta);
+        for (int i = 0; i < N_BASIS; i++) free(A[i]);
+        free(A); free(b);
+    }
+
+    // Compute present value
+    float value = 0.0f;
+    for (int m = 0; m < M; m++) {
+        for (int t = 0; t < N; t++) {
+            float c = cashflows[t * M + m];
+            value += DISCOUNT(t * dT, r) * c;
+        }
+    }
+    value /= M;
+
+    free(cashflows);
+    free(exercised);
+    free(exercise_count);
+
+    return value;
+}
+
 void generate_quantization_grids(const SimulationParams *sim, const AR1ModelParams *h_ar1, float *h_Gamma) {
     for (int k = 0; k < sim->N_STEPS; k++) {
         float x_std[2];
@@ -223,8 +285,10 @@ void run_options_pipeline(const SimulationParams *sim, const AR1ModelParams *h_a
 
     // host
     float *h_Gamma = NULL; 
+    float *h_paths = NULL;
 
     checkCudaErrors(cudaMallocHost(&h_Gamma, gamma_bytes));
+    checkCudaErrors(cudaMallocHost(&h_paths, path_bytes));
 
     // device
     AR1ModelParams *d_ar1 = NULL;
@@ -236,7 +300,7 @@ void run_options_pipeline(const SimulationParams *sim, const AR1ModelParams *h_a
     int *d_pki = NULL;
     curandState *d_rng_states = NULL;
 
-    checkCudaErrors(cudaMalloc(&d_ar1, sizeof(AR1ModelParams)));                // ar1 params for device
+    checkCudaErrors(cudaMalloc(&d_ar1, sizeof(AR1ModelParams)));                // ar1 sim for device
     cudaMemcpy(d_ar1, h_ar1, sizeof(AR1ModelParams), cudaMemcpyHostToDevice);
 
     checkCudaErrors(cudaMalloc(&d_paths, path_bytes));      // simulation paths
@@ -268,12 +332,13 @@ void run_options_pipeline(const SimulationParams *sim, const AR1ModelParams *h_a
         d_paths, d_ar1, d_rng_states, m_paths, n_steps
     );
     checkCudaErrors(cudaDeviceSynchronize());
+    cudaMemcpy(h_paths, d_paths, path_bytes, cudaMemcpyDeviceToHost);
+
+// Longstaff-Schwartz CPU only
+    float V_LSM = price_LSM(h_paths, sim);
 
 // to do
-    // // Run Longstaff-Schwartz
-    // V_LSM = price_LSM();
-
-    // // Run Tree Quantization Algorithm II
+    // Tree Quantization Algorithm II
     // estimate_transition_probabilities_algo2();
     // V_TQ2 = backward_induction_quantized();
 
@@ -320,11 +385,10 @@ void printUsage(char *prog) {
     printf("  -q  Minimum quantity - - - - - - - -  50\n");
     printf("  -Q  Maximum quantity - - - - - - - -  150\n");
     printf("  -S  Random number generator seed - -  42\n");
-    printf("Put the following options last:\n");
-    printf("  -a1 First Gaussian weight alpha1 - -  1.0\n");
-    printf("  -a2 Second Gaussian weight alpha2  -  0.4\n");
-    printf("  -s1 First Gaussian sigma1  - - - - -  0.3\n");
-    printf("  -s2 Second Gaussian sigma2 - - - - -  0.2\n");
+    printf("  -w First Gaussian weight alpha1 - -  1.0\n");
+    printf("  -x Second Gaussian weight alpha2  -  0.4\n");
+    printf("  -y First Gaussian sigma1  - - - - -  0.3\n");
+    printf("  -z Second Gaussian sigma2 - - - - -  0.2\n");
 }
 
 void printSimulationParams(SimulationParams *sim) {
@@ -403,7 +467,7 @@ int main(int argc, char **argv) {
     int val_i;
     float val_f;
     unsigned long val_ul;
-    while ((opt = getopt(argc, argv, "m:n:g:t:s:k:r:q:Q:S:")) != -1) {
+    while ((opt = getopt(argc, argv, "m:n:g:t:s:k:r:q:Q:S:w:x:y:z:")) != -1) {
         switch (opt) {
             case 'm':
                 val_i = atoi(optarg);
@@ -445,28 +509,26 @@ int main(int argc, char **argv) {
                 val_ul = strtoul(optarg, NULL, 10);
                 if (val_ul > 0UL) sim->RNG_SEED = val_ul;
                 break;
+            case 'w':
+                val_f = atof(optarg);
+                if (val_f > 0.0f) sim->alpha1 = val_f; 
+                break;
+            case 'x':
+                val_f = atof(optarg);
+                if (val_f > 0.0f) sim->alpha2 = val_f; 
+                break;
+            case 'y':
+                val_f = atof(optarg);
+                if (val_f > 0.0f) sim->sigma1 = val_f; 
+                break;
+            case 'z':
+                val_f = atof(optarg);
+                if (val_f > 0.0f) sim->sigma2 = val_f; 
+                break;
             default:
                 printUsage(argv[0]);
                 free(sim);
                 exit(EXIT_FAILURE);
-        }
-    }
-
-    for (int i = optind; i < argc; i++) {
-        bool param_idx_valid = i + 1 < argc;
-        if (!strcmp(argv[i], "-a1") && param_idx_valid) {
-            sim->alpha1 = atof(argv[++i]);
-        } else if (!strcmp(argv[i], "-a2") && param_idx_valid) {
-            sim->alpha2 = atof(argv[++i]);
-        } else if (!strcmp(argv[i], "-s1") && param_idx_valid) {
-            sim->sigma1 = atof(argv[++i]);
-        } else if (!strcmp(argv[i], "-s2") && param_idx_valid) {
-            sim->sigma2 = atof(argv[++i]);
-        } else {
-            fprintf(stderr, "Unknown or incomplete argument: %s\n", argv[i]);
-            printUsage(argv[0]);
-            free(sim);
-            exit(EXIT_FAILURE);
         }
     }
 
