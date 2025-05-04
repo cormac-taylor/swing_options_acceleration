@@ -14,25 +14,24 @@
 
 typedef struct {
     // Simulation control
-    int M_PATHS;       // Number of Monte Carlo paths
-    int N_STEPS;       // Number of time steps
-    float T;           // Maturity (in years)
-    float dT;          // Time step size = T / N_STEPS
+    int M_PATHS;       // num Monte Carlo paths
+    int N_STEPS;       // num time steps
+    float T;           // years to maturity
+    float dT;          // time step size
 
     // Option parameters
-    float S0;          // Initial asset price
-    float K;           // Strike price
-    float r;           // Risk-free rate
-    int Q_min, Q_max;  // Min and max exercise rights
+    float S0;          // initial asset price
+    float K;           // strike price
+    float r;           // risk-free rate
+    int Q_min, Q_max;  // min and max exercise rights
 
     // Longstaff-Schwartz
-    int N_BASIS;       // Number of basis functions for regression
+    int N_BASIS;       // num basis functions in regression
 
     // Quantization
-    int N_GRID;        // Number of grid points per time step
-    int N_DIM;         // State space dimensionality (1 for GBM, 2 for OU)
+    int N_GRID;        // num grid points per time step
+    int N_DIM;         // state space dim: 1 for GBM, 2 for OU
 
-    // Random number generation
     unsigned long RNG_SEED;
 
     // AR(1) 
@@ -43,21 +42,230 @@ typedef struct {
 } SimulationParams;
 
 typedef struct {
-    float X0[MAX_DIM];                          // Initial state
+    float X0[MAX_DIM];                          // initial state
     float A[MAX_STEPS][MAX_DIM][MAX_DIM];       // A_k transition matrices
     float Tmat[MAX_STEPS][MAX_DIM][MAX_DIM];    // T_k volatility matrices
 } AR1ModelParams;
 
+// __device__ nearest_neighbor(...) {
+//     // to do
+// }
 
-void run_options_pipeline(SimulationParams *sim, AR1ModelParams *ar1) {
-    // init_parameters();
-    // allocate_memory();
+// __device__ generate_epsilon(...){
+//     // to do
+// }
 
-    // generate_quantization_grids();  // Shared between TQ-II and TQ-III
+// __device__ apply_AR1(...){
+//     // to do
+// }
 
-    // // Monte Carlo simulation
-    // simulate_paths();  // For LSM (used directly), for TQ (used for transition estimation)
+// price_LSM() {
+//     // to do
+//     paths = simulate_paths();  // [M x N_STEPS] array
 
+//     V = evaluate_payoff(paths, N_STEPS); // Final payoff
+
+//     for (k = N_STEPS - 1; k >= 0; k--) {
+//         X = paths[:, k];
+//         C = regress_continuation_value(X, V);  // Least squares regression
+//         E = evaluate_payoff(X, k);
+
+//         for each path i:
+//             V[i] = max(E[i], C[i]);  // Choose to exercise or continue
+//     }
+
+//     return average(V);
+// }
+
+// estimate_transition_probabilities_algo2() {
+//     // to do
+//     for each path m in parallel:
+//         x = x0;
+//         i = nearest_neighbor(x, Gamma[0]);
+
+//         for (k = 1 to N_STEPS):
+//             epsilon = generate_normal();
+//             x = A_k * x + T_k * epsilon;
+
+//             j = nearest_neighbor(x, Gamma[k]);
+//             atomicAdd(p_k_ij[k][i][j], 1);
+//             atomicAdd(p_k_i[k][j], 1);
+//             i = j;
+// }
+// estimate_transition_probabilities_algo3() {
+//     // to do
+//     for each time step k in parallel:
+//         for each path m in parallel:
+//             Xk = sample_from_Xk();  // Draw x from known distribution
+//             epsilon = generate_normal();
+
+//             i = nearest_neighbor(Xk, Gamma[k]);
+//             x_next = A_k * Xk + T_k * epsilon;
+//             j = nearest_neighbor(x_next, Gamma[k+1]);
+
+//             atomicAdd(p_k_ij[k][i][j], 1);
+//             atomicAdd(p_k_i[k][i], 1);
+// }
+
+// backward_induction_quantized() {
+//     // to do
+//     V[N_STEPS][*] = evaluate_payoff(Gamma[N_STEPS]);
+
+//     for k = N_STEPS - 1 to 0:
+//         for i in 0 to Nk:
+//             continuation = 0;
+//             for j in 0 to Nk+1:
+//                 continuation += P_k_ij[k][i][j] * V[k+1][j];
+//             V[k][i] = max(payoff(Gamma[k][i]), continuation);
+// }
+
+__global__ void init_rng_kernel(curandState *states, unsigned long seed, int M) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < M)
+        curand_init(seed, tid, 0, &states[tid]);
+}
+
+__global__ void simulate_paths_kernel(
+    float *d_paths,
+    const AR1ModelParams *ar1,
+    curandState *d_rng_states,
+    const int M_PATHS,
+    const int N_STEPS
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= M_PATHS) return;
+
+    const int N_DIM = 2;
+    float X_curr[N_DIM];
+    float X_next[N_DIM];
+
+    // load initial state
+    for (int d = 0; d < N_DIM; d++) {
+        X_curr[d] = ar1->X0[d];
+        d_paths[(d * N_STEPS + 0) * M_PATHS + tid] = X_curr[d];
+    }
+
+    curandState local_state = d_rng_states[tid];
+
+    for (int k = 0; k < N_STEPS - 1; k++) {
+        float Z[N_DIM];
+        for (int d = 0; d < N_DIM; d++) {
+            Z[d] = curand_normal(&local_state);
+        }
+
+        // X_{k+1} = A_k * X_k + T_k * Z
+        for (int i = 0; i < N_DIM; i++) {
+            float sum = 0.0f;
+            for (int j = 0; j < N_DIM; j++) {
+                sum += ar1->A[k][i][j] * X_curr[j];
+            }
+            for (int j = 0; j < N_DIM; j++) {
+                sum += ar1->Tmat[k][i][j] * Z[j];
+            }
+            X_next[i] = sum;
+        }
+
+        for (int d = 0; d < N_DIM; d++) {
+            d_paths[(d * N_STEPS + (k + 1)) * M_PATHS + tid] = X_next[d];
+            X_curr[d] = X_next[d];
+        }
+    }
+
+    d_rng_states[tid] = local_state;
+}
+
+void generate_quantization_grids(const SimulationParams *sim, const AR1ModelParams *ar1, float *h_Gamma) {
+    for (int k = 0; k < sim->N_STEPS; k++) {
+        float x_std[2];
+
+        for (int d = 0; d < 2; d++) {
+            // std deviation assuming mean 0
+            float var = 0.0f;
+            for (int j = 0; j < 2; j++) {
+                var += ar1->Tmat[k][d][j] * ar1->Tmat[k][d][j];
+            }
+            x_std[d] = sqrtf(var);
+        }
+
+        // square grid uniformly distributed within 3 std
+        int grid_size = sim->N_GRID;
+        int side = (int)sqrt(grid_size);
+        if (side * side != grid_size) {
+            fprintf(stderr, "N_GRID must be a perfect square (e.g., 100, 225, 400)\n");
+            exit(1);
+        }
+
+        for (int i = 0; i < side; i++) {
+            float x1 = -3.0f * x_std[0] + (6.0f * x_std[0]) * i / (side - 1);
+            for (int j = 0; j < side; j++) {
+                float x2 = -3.0f * x_std[1] + (6.0f * x_std[1]) * j / (side - 1);
+                int idx = i * side + j;
+                h_Gamma[(k * grid_size + idx) * 2 + 0] = x1;
+                h_Gamma[(k * grid_size + idx) * 2 + 1] = x2;
+            }
+        }
+    }
+}
+  
+void run_options_pipeline(const SimulationParams *sim, const AR1ModelParams *ar1) {
+// memory allocation
+    const int m_paths = sim->M_PATHS;
+    const int n_steps = sim->N_STEPS;
+    const int n_dim = sim->N_DIM;
+    const int n_grid = sim->N_GRID;
+
+    size_t path_bytes = sizeof(float) * m_paths * n_steps * n_dim;
+    size_t V_bytes = sizeof(float) * m_paths;
+    size_t gamma_bytes = sizeof(float) * n_steps * n_grid * n_dim;
+    size_t pkij_bytes = sizeof(int) * n_steps * n_grid * n_grid;
+    size_t pki_bytes = sizeof(int) * n_steps * n_grid;
+    size_t Pkij_bytes = sizeof(float) * n_steps * n_grid * n_grid;
+
+    // host
+    float *h_Gamma = NULL; 
+
+    checkCudaErrors(cudaMallocHost(&h_Gamma, gamma_bytes));
+
+    // device
+    float *d_paths = NULL;
+    float *d_V = NULL;
+    float *d_Gamma = NULL;
+    float *d_Pkij = NULL;
+    int *d_pkij = NULL;
+    int *d_pki = NULL;
+    curandState *d_rng_states = NULL;
+
+    checkCudaErrors(cudaMalloc(&d_paths, path_bytes));      // simulation paths
+    checkCudaErrors(cudaMalloc(&d_V, V_bytes));             // value vector
+    checkCudaErrors(cudaMalloc(&d_Gamma, gamma_bytes));     // quantization grids
+    checkCudaErrors(cudaMalloc(&d_Pkij, Pkij_bytes));       // transition probabilities
+
+    // transition counters for both quatizations
+    checkCudaErrors(cudaMalloc(&d_pkij, pkij_bytes));
+    checkCudaErrors(cudaMalloc(&d_pki, pki_bytes));
+    checkCudaErrors(cudaMemset(d_pkij, 0, pkij_bytes));
+    checkCudaErrors(cudaMemset(d_pki, 0, pki_bytes));
+
+    checkCudaErrors(cudaMalloc(&d_rng_states, sizeof(curandState) * m_paths));      // RNG states
+
+// init quatization grid
+    generate_quantization_grids(sim, ar1, h_Gamma);
+    cudaMemcpy(d_Gamma, h_Gamma, gamma_bytes, cudaMemcpyHostToDevice);
+
+    dim3 block(256);
+    dim3 grid((m_paths + block.x - 1) / block.x);
+
+// init rng
+    init_rng_kernel<<<grid, block>>>(d_rng_states, sim->RNG_SEED, m_paths);
+    checkCudaErrors(cudaDeviceSynchronize());
+
+// Monte Carlo simulation
+    simulate_paths_kernel<<<grid, block>>>(
+        d_paths, ar1, d_rng_states, m_paths, n_steps
+    );
+    checkCudaErrors(cudaDeviceSynchronize());
+
+// to do
     // // Run Longstaff-Schwartz
     // V_LSM = price_LSM();
 
@@ -71,16 +279,36 @@ void run_options_pipeline(SimulationParams *sim, AR1ModelParams *ar1) {
 
     // print_results(V_LSM, V_TQ2, V_TQ3);
     // compare_performance();
-    // cleanup();
+
+// clean up
+    if (h_Gamma) cudaFreeHost(h_Gamma);
+
+    h_Gamma = NULL;
+
+    if (d_paths) cudaFree(d_paths);
+    if (d_V) cudaFree(d_V);
+    if (d_Gamma) cudaFree(d_Gamma);
+    if (d_pkij) cudaFree(d_pkij);
+    if (d_pki) cudaFree(d_pki);
+    if (d_Pkij) cudaFree(d_Pkij);
+    if (d_rng_states) cudaFree(d_rng_states);
+
+    d_paths = NULL;
+    d_V = NULL;
+    d_Gamma = NULL;
+    d_pkij = NULL;
+    d_pki = NULL;
+    d_Pkij = NULL;
+    d_rng_states = NULL;    
 }
 
 
 void printUsage(char *prog) {
     printf("Usage: %s [OPTIONS]\n", prog);
-    printf("Options:                                defaults:\n");
+    printf("Options:                                Defaults:\n");
     printf("  -m  Number of Monte Carlo samples  -  100000\n");
     printf("  -n  Number of time steps - - - - - -  365\n");
-    printf("  -g  Grid size per time step  - - - -  250\n");
+    printf("  -g  Grid size per time step  - - - -  400\n");
     printf("  -t  Time (years) to maturity - - - -  1.0\n");
     printf("  -s  Initial stock price  - - - - - -  100.0\n");
     printf("  -k  Strike price - - - - - - - - - -  100.0\n");
@@ -88,7 +316,6 @@ void printUsage(char *prog) {
     printf("  -q  Minimum quantity - - - - - - - -  50\n");
     printf("  -Q  Maximum quantity - - - - - - - -  150\n");
     printf("  -S  Random number generator seed - -  42\n");
-
     printf("Put the following options last:\n");
     printf("  -a1 First Gaussian weight alpha1 - -  1.0\n");
     printf("  -a2 Second Gaussian weight alpha2  -  0.4\n");
@@ -115,7 +342,6 @@ void printSimulationParams(SimulationParams *sim) {
 }
 
 void init_SimulationParams(SimulationParams *sim) {
-    
     sim->M_PATHS = 100000;
     sim->N_STEPS = 365;
     sim->T = 1.0f;
@@ -126,7 +352,7 @@ void init_SimulationParams(SimulationParams *sim) {
     sim->Q_min = 50;
     sim->Q_max = 150;
     sim->N_BASIS = 3;
-    sim->N_GRID = 250;
+    sim->N_GRID = 400;
     sim->N_DIM = 2;
     sim->RNG_SEED = 42UL;
     sim->alpha1 = 1.0f;
@@ -149,13 +375,11 @@ void init_AR1ModelParams(AR1ModelParams *ar1, SimulationParams *sim) {
         float e1 = expf(-alpha1 * dT);
         float e2 = expf(-alpha2 * dT);
 
-        // A_k = diag(e1, e2)
         ar1->A[k][0][0] = e1;
         ar1->A[k][0][1] = 0.0f;
         ar1->A[k][1][0] = 0.0f;
         ar1->A[k][1][1] = e2;
 
-        // T_k = sqrt(Var) = diag(sigma_i * sqrt((1 - e^{-2*alpha_i*delta_t}) / (2*alpha_i)))
         float var1 = sigma1 * sqrtf((1 - expf(-2.0f * alpha1 * dT)) / (2.0f * alpha1));
         float var2 = sigma2 * sqrtf((1 - expf(-2.0f * alpha2 * dT)) / (2.0f * alpha2));
 
@@ -241,11 +465,6 @@ int main(int argc, char **argv) {
             exit(EXIT_FAILURE);
         }
     }
-
-
-    // #define MAX_STEPS   366
-    // #define MAX_GRID    500
-
 
     AR1ModelParams *ar1 = (AR1ModelParams*) malloc(sizeof(AR1ModelParams));
     init_AR1ModelParams(ar1, sim);
