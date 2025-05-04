@@ -10,7 +10,7 @@
 #define PUT         false
 #define MAX_STEPS   366
 #define MAX_DIM     2
-#define MAX_GRID    500
+#define MAX_GRID    1000
 #define MAX_BASIS   5
 #define DISCOUNT(dt, r) (expf(-(r) * (dt)))
 
@@ -102,6 +102,160 @@ __global__ void simulate_paths_kernel(
     }
 
     d_rng_states[tid] = local_state;
+}
+
+__device__ int find_nearest_neighbor(const float* X, const float* Gamma_k, int N_GRID, int N_DIM) {
+    float min_dist = INFINITY;
+    int min_idx = 0;
+    for (int i = 0; i < N_GRID; i++) {
+        float dist_sq = 0.0f;
+        for (int d = 0; d < N_DIM; d++) {
+            float diff = X[d] - Gamma_k[i * N_DIM + d];
+            dist_sq += diff * diff;
+        }
+        if (dist_sq < min_dist) {
+            min_dist = dist_sq;
+            min_idx = i;
+        }
+    }
+    return min_idx;
+}
+
+__global__ void estimate_transition_probabilities_algo2_kernel(
+    const AR1ModelParams *d_ar1,
+    const float *d_Gamma,
+    int *d_pkij,
+    int *d_pki,
+    curandState *d_rng_states,
+    int M_PATHS,
+    int N_STEPS,
+    int N_GRID,
+    int N_DIM
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= M_PATHS) return;
+
+    curandState local_state = d_rng_states[tid];
+    float X_curr[MAX_DIM];
+    for (int d = 0; d < N_DIM; d++) {
+        X_curr[d] = d_ar1->X0[d];
+    }
+
+    for (int k = 0; k < N_STEPS - 1; k++) {
+        float epsilon[MAX_DIM];
+        for (int d = 0; d < N_DIM; d++) {
+            epsilon[d] = curand_normal(&local_state);
+        }
+
+        // X_next = A[k] * X_curr + T[k] * epsilon
+        float X_next[MAX_DIM] = {0.0f};
+        for (int i = 0; i < N_DIM; i++) {
+            for (int j = 0; j < N_DIM; j++) {
+                X_next[i] += d_ar1->A[k][i][j] * X_curr[j];
+            }
+            for (int j = 0; j < N_DIM; j++) {
+                X_next[i] += d_ar1->Tmat[k][i][j] * epsilon[j];
+            }
+        }
+
+        // nearest neighbor in grid (cur time step)
+        const float* Gamma_k = &d_Gamma[k * N_GRID * N_DIM];
+        int i = find_nearest_neighbor(X_curr, Gamma_k, N_GRID, N_DIM);
+
+        // nearest neighbor in grid (next time step)
+        const float* Gamma_k_next = &d_Gamma[(k + 1) * N_GRID * N_DIM];
+        int j = find_nearest_neighbor(X_next, Gamma_k_next, N_GRID, N_DIM);
+
+        // update counters
+        int pkij_index = k * N_GRID * N_GRID + i * N_GRID + j;
+        atomicAdd(&d_pkij[pkij_index], 1);
+
+        int pki_index = k * N_GRID + i;
+        atomicAdd(&d_pki[pki_index], 1);
+
+        for (int d = 0; d < N_DIM; d++) {
+            X_curr[d] = X_next[d];
+        }
+    }
+
+    d_rng_states[tid] = local_state;
+}
+
+__global__ void compute_transition_probabilities_kernel(
+    float *d_Pkij,
+    const int *d_pkij,
+    const int *d_pki,
+    int N_STEPS,
+    int N_GRID
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_elements = N_STEPS * N_GRID * N_GRID;
+    if (idx >= total_elements) return;
+
+    int k = idx / (N_GRID * N_GRID);
+    int remainder = idx % (N_GRID * N_GRID);
+    int i = remainder / N_GRID;
+    int j = remainder % N_GRID;
+
+    int pki_index = k * N_GRID + i;
+    int pkij_index = k * N_GRID * N_GRID + i * N_GRID + j;
+
+    int count = d_pkij[pkij_index];
+    int total = d_pki[pki_index];
+
+    if (total > 0) {
+        d_Pkij[pkij_index] = (float)count / (float)total;
+    } else {
+        d_Pkij[pkij_index] = 0.0f;
+    }
+}
+
+__global__ void initialize_payoff_kernel(
+    float *d_V,
+    const float *d_Gamma,
+    float K,
+    int N_GRID,
+    int N_DIM,
+    int k_step
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N_GRID) return;
+
+    // Extract the grid point for time k_step (maturity)
+    const float* Gamma_k = &d_Gamma[k_step * N_GRID * N_DIM];
+    float S = Gamma_k[i * N_DIM + 0];  // First dimension is asset price S
+
+    d_V[i] = fmaxf(K - S, 0.0f);  // Put payoff
+}
+
+__global__ void backward_induction_kernel(
+    float *d_V_current,
+    const float *d_V_next,
+    const float *d_Gamma,
+    const float *d_Pkij,
+    float discount,
+    float K,
+    int N_GRID,
+    int N_DIM,
+    int k_step
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N_GRID) return;
+
+    // Extract grid point for current time k_step
+    const float* Gamma_k = &d_Gamma[k_step * N_GRID * N_DIM];
+    float S = Gamma_k[i * N_DIM + 0];  // First dimension is S
+    float immediate = fmaxf(K - S, 0.0f);
+
+    // Compute continuation value using transition probabilities
+    float continuation = 0.0f;
+    for (int j = 0; j < N_GRID; j++) {
+        int pkij_idx = k_step * N_GRID * N_GRID + i * N_GRID + j;
+        continuation += d_Pkij[pkij_idx] * d_V_next[j];
+    }
+    continuation *= discount;
+
+    d_V_current[i] = fmaxf(immediate, continuation);
 }
 
 static float payoff(float S, float K) {
@@ -236,6 +390,65 @@ float price_LSM(float *h_paths, const SimulationParams *sim) {
     return value;
 }
 
+float compute_TQ2_price(
+    const SimulationParams *sim,
+    const float *d_Gamma,
+    const float *d_Pkij
+) {
+    // Allocate device memory for value functions
+    float *d_V_current, *d_V_next;
+    checkCudaErrors(cudaMalloc(&d_V_current, sizeof(float) * sim->N_GRID));
+    checkCudaErrors(cudaMalloc(&d_V_next, sizeof(float) * sim->N_GRID));
+
+    // Initialize payoff at maturity (k = N_STEPS - 1)
+    dim3 blockSize(256);
+    dim3 gridSize((sim->N_GRID + blockSize.x - 1) / blockSize.x);
+    initialize_payoff_kernel<<<gridSize, blockSize>>>(
+        d_V_next, d_Gamma, sim->K, sim->N_GRID, sim->N_DIM, sim->N_STEPS - 1
+    );
+    checkCudaErrors(cudaDeviceSynchronize());
+
+    // Precompute discount factor
+    float discount = expf(-sim->r * sim->dT);
+
+    // Backward induction from k = N_STEPS-2 to k = 0
+    for (int k = sim->N_STEPS - 2; k >= 0; k--) {
+        backward_induction_kernel<<<gridSize, blockSize>>>(
+            d_V_current,
+            d_V_next,
+            d_Gamma,
+            d_Pkij,
+            discount,
+            sim->K,
+            sim->N_GRID,
+            sim->N_DIM,
+            k
+        );
+        checkCudaErrors(cudaDeviceSynchronize());
+
+        // Swap pointers for next iteration
+        float *temp = d_V_current;
+        d_V_current = d_V_next;
+        d_V_next = temp;
+    }
+
+    // Transfer final V_0 values to host
+    float *h_V0 = (float*)malloc(sim->N_GRID * sizeof(float));
+    checkCudaErrors(cudaMemcpy(h_V0, d_V_next, sim->N_GRID * sizeof(float), cudaMemcpyDeviceToHost));
+
+    // Find center grid point (assumes X0 = [0,0] and square grid)
+    int side = (int)sqrt(sim->N_GRID);
+    int center_idx = (side / 2) * side + (side / 2);
+    float V_TQ2 = h_V0[center_idx];
+
+    // Cleanup
+    free(h_V0);
+    checkCudaErrors(cudaFree(d_V_current));
+    checkCudaErrors(cudaFree(d_V_next));
+
+    return V_TQ2;
+}
+
 void generate_quantization_grids(const SimulationParams *sim, const AR1ModelParams *h_ar1, float *h_Gamma) {
     for (int k = 0; k < sim->N_STEPS; k++) {
         float x_std[2];
@@ -337,10 +550,12 @@ void run_options_pipeline(const SimulationParams *sim, const AR1ModelParams *h_a
 // Longstaff-Schwartz CPU only
     float V_LSM = price_LSM(h_paths, sim);
 
-// to do
-    // Tree Quantization Algorithm II
-    // estimate_transition_probabilities_algo2();
-    // V_TQ2 = backward_induction_quantized();
+// Tree Quantization Algorithm II
+    float V_TQ2 = compute_TQ2_price(sim, d_Gamma, d_Pkij);
+
+    printf("\n=== Pricing Results ===\n");
+    printf("LSM Price:  %.6f\n", V_LSM);
+    printf("TQ2 Price:  %.6f\n", V_TQ2);
 
     // // Run Tree Quantization Algorithm III
     // estimate_transition_probabilities_algo3();
