@@ -95,7 +95,7 @@ __global__ void simulate_paths_kernel(
             X_next[i] = sum;
         }
 
-        for (int d = 0; d < N_DIM; d++) {
+        for (int d = 0; d < N_DIM; d++) {    
             d_paths[(d * N_STEPS + (k + 1)) * M_PATHS + tid] = X_next[d];
             X_curr[d] = X_next[d];
         }
@@ -221,11 +221,10 @@ __global__ void initialize_payoff_kernel(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N_GRID) return;
 
-    // Extract the grid point for time k_step (maturity)
     const float* Gamma_k = &d_Gamma[k_step * N_GRID * N_DIM];
-    float S = Gamma_k[i * N_DIM + 0];  // First dimension is asset price S
-
-    d_V[i] = fmaxf(K - S, 0.0f);  // Put payoff
+    float X = Gamma_k[i * N_DIM + 0];
+    float S = expf(X);
+    d_V[i] = fmaxf(K - S, 0.0f);
 }
 
 __global__ void backward_induction_kernel(
@@ -242,9 +241,9 @@ __global__ void backward_induction_kernel(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N_GRID) return;
 
-    // Extract grid point for current time k_step
     const float* Gamma_k = &d_Gamma[k_step * N_GRID * N_DIM];
-    float S = Gamma_k[i * N_DIM + 0];  // First dimension is S
+    float X = Gamma_k[i * N_DIM + 0];  // Log-price X
+    float S = expf(X);                  // Convert to S
     float immediate = fmaxf(K - S, 0.0f);
 
     // Compute continuation value using transition probabilities
@@ -450,11 +449,12 @@ float compute_TQ2_price(
 }
 
 void generate_quantization_grids(const SimulationParams *sim, const AR1ModelParams *h_ar1, float *h_Gamma) {
-    for (int k = 0; k < sim->N_STEPS; k++) {
-        float x_std[2];
+    float X0_logS = logf(sim->S0);  // X0 = log(S0)
 
+    for (int k = 0; k < sim->N_STEPS; k++) {
+        // Compute grid centered at X0_logS, not 0
+        float x_std[2];
         for (int d = 0; d < 2; d++) {
-            // std deviation assuming mean 0
             float var = 0.0f;
             for (int j = 0; j < 2; j++) {
                 var += h_ar1->Tmat[k][d][j] * h_ar1->Tmat[k][d][j];
@@ -462,18 +462,13 @@ void generate_quantization_grids(const SimulationParams *sim, const AR1ModelPara
             x_std[d] = sqrtf(var);
         }
 
-        // square grid uniformly distributed within 3 std
         int grid_size = sim->N_GRID;
         int side = (int)sqrt(grid_size);
-        if (side * side != grid_size) {
-            fprintf(stderr, "N_GRID must be a perfect square (e.g., 100, 225, 400)\n");
-            exit(1);
-        }
-
+        // Center grid around X0_logS for the first dimension (log-price)
         for (int i = 0; i < side; i++) {
-            float x1 = -3.0f * x_std[0] + (6.0f * x_std[0]) * i / (side - 1);
+            float x1 = X0_logS - 3.0f * x_std[0] + (6.0f * x_std[0]) * i / (side - 1);
             for (int j = 0; j < side; j++) {
-                float x2 = -3.0f * x_std[1] + (6.0f * x_std[1]) * j / (side - 1);
+                float x2 = -3.0f * x_std[1] + (6.0f * x_std[1]) * j / (side - 1);  // Second dimension unchanged
                 int idx = i * side + j;
                 h_Gamma[(k * grid_size + idx) * 2 + 0] = x1;
                 h_Gamma[(k * grid_size + idx) * 2 + 1] = x2;
@@ -481,7 +476,7 @@ void generate_quantization_grids(const SimulationParams *sim, const AR1ModelPara
         }
     }
 }
-  
+
 void run_options_pipeline(const SimulationParams *sim, const AR1ModelParams *h_ar1) {
 // memory allocation
     const int m_paths = sim->M_PATHS;
@@ -645,9 +640,8 @@ void init_SimulationParams(SimulationParams *sim) {
 }
 
 void init_AR1ModelParams(AR1ModelParams *ar1, SimulationParams *sim) {
-    for (int d = 0; d < MAX_DIM; d++) {
-        ar1->X0[d] = 0.0f;
-    }
+    ar1->X0[0] = logf(sim->S0);  // First dimension is log(S0)
+    ar1->X0[1] = 0.0f;           // Second dimension (e.g., volatility factor)
 
     const float dT = sim->dT;
     const float alpha1 = sim->alpha1, alpha2 = sim->alpha2;
@@ -726,11 +720,11 @@ int main(int argc, char **argv) {
                 break;
             case 'w':
                 val_f = atof(optarg);
-                if (val_f > 0.0f) sim->alpha1 = val_f; 
+                if (val_f >= 0.0f) sim->alpha1 = val_f; 
                 break;
             case 'x':
                 val_f = atof(optarg);
-                if (val_f > 0.0f) sim->alpha2 = val_f; 
+                if (val_f >= 0.0f) sim->alpha2 = val_f; 
                 break;
             case 'y':
                 val_f = atof(optarg);

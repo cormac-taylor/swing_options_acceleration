@@ -1,0 +1,21 @@
+# Lab 4: Improving Tree Quantization for American Style Option Pricing using CUDA
+
+## Paper
+
+[GPGPUs in computational finance: Massive parallel computing for American style options](https://arxiv.org/abs/1101.3228)
+
+## Executing the program on our Gateway Server
+
+- **Compile**:
+```sh
+nvcc -o lsm_cpu lsm_cpu.cu
+```
+```sh
+nvcc -o lsm_gpu lsm_gpu.cu -I/scratch/cuda-samples/Common -lcublas
+```
+```sh
+nvcc -arch=sm_70 -O3 qt2.cu -o qt2 -lcurand
+```
+```sh
+nvcc -arch=sm_70 -O3 qt3.cu -o qt3 -lcurand
+```
