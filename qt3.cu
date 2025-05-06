@@ -3,6 +3,7 @@
 #include <math.h>
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
+#include "qt3.h"
 
 #define NUM_TIMESTEPS 365
 #define NUM_PATHS 100000       // Monte Carlo paths
@@ -14,7 +15,7 @@
 #define RISKFREE 0.05f         // risk-free rate
 
 // generate quantization grid
-void generate_grid(float *grid, int size, float mean, float stddev) {
+void generate_grid_qt3(float *grid, int size, float mean, float stddev) {
     for(int i=0; i<size; i++) {
         float u = (i + 0.5f) / size;
         grid[i] = mean + stddev * sqrtf(-2.0f * logf(u)) * cosf(2.0f * M_PI * u);
@@ -22,7 +23,7 @@ void generate_grid(float *grid, int size, float mean, float stddev) {
 }
 
 // compute transitions
-__global__ void compute_transitions(int *d_p_ij, int *d_p_i, float *d_grid, 
+__global__ void compute_transitions_qt3(int *d_p_ij, int *d_p_i, float *d_grid, 
                                    int num_timesteps, int num_paths, int grid_size,
                                    float stddev) {
     int k = blockIdx.x;
@@ -74,7 +75,7 @@ __global__ void compute_transitions(int *d_p_ij, int *d_p_i, float *d_grid,
 }
 
 // backward induction
-void backward_induction(float *grid, int *p_ij, int *p_i, float *values) {
+void backward_induction_qt3(float *grid, int *p_ij, int *p_i, float *values) {
     float dt = 1.0f / NUM_TIMESTEPS;
     
     for(int i=0; i<NUM_GRID; i++) {
@@ -105,12 +106,12 @@ void backward_induction(float *grid, int *p_ij, int *p_i, float *values) {
     }
 }
 
-int main() {
+extern "C" void qt3() {
     float stddev = SIGMA / sqrtf(1.0f - ALPHA*ALPHA);
     
     float *h_grid = new float[NUM_TIMESTEPS * NUM_GRID];
     for(int k=0; k<NUM_TIMESTEPS; k++)
-        generate_grid(h_grid + k*NUM_GRID, NUM_GRID, 0.0f, stddev);
+        generate_grid_qt3(h_grid + k*NUM_GRID, NUM_GRID, 0.0f, stddev);
 
     float *d_grid;
     int *d_p_ij, *d_p_i;
@@ -123,7 +124,7 @@ int main() {
     cudaMemset(d_p_i, 0, NUM_TIMESTEPS * NUM_GRID * sizeof(int));
 
     dim3 grid_dim(NUM_TIMESTEPS, (NUM_PATHS + BLOCK_SIZE-1)/BLOCK_SIZE);
-    compute_transitions<<<grid_dim, BLOCK_SIZE>>>(d_p_ij, d_p_i, d_grid, 
+    compute_transitions_qt3<<<grid_dim, BLOCK_SIZE>>>(d_p_ij, d_p_i, d_grid, 
                                                  NUM_TIMESTEPS, NUM_PATHS, NUM_GRID,
                                                  stddev);
 
@@ -135,7 +136,7 @@ int main() {
                cudaMemcpyDeviceToHost);
 
     float *h_values = new float[NUM_TIMESTEPS * NUM_GRID];
-    backward_induction(h_grid, h_p_ij, h_p_i, h_values);
+    backward_induction_qt3(h_grid, h_p_ij, h_p_i, h_values);
 
     float price = 0.0f;
     for(int i=0; i<NUM_GRID; i++) 
@@ -145,5 +146,4 @@ int main() {
 
     delete[] h_grid; delete[] h_p_ij; delete[] h_p_i; delete[] h_values;
     cudaFree(d_grid); cudaFree(d_p_ij); cudaFree(d_p_i);
-    return 0;
 }

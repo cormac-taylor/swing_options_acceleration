@@ -3,6 +3,7 @@
 #include <random>
 #include <cmath>
 #include <algorithm>
+#include "lsm_cpu.h"
 
 using namespace std;
 
@@ -15,14 +16,8 @@ const float S0 = 100.0f;
 const int MAX_EXERCISE = 5;
 const float DT = 1.0f / NUM_TIMESTEPS;
 
-struct PathData {
-    vector<float> prices;
-    float cashflow;
-    int remaining;
-};
-
 // GBM
-vector<PathData> simulate_paths() {
+vector<PathData> simulate_paths_lsm_cpu() {
     vector<PathData> paths(NUM_PATHS);
     mt19937 rng(1234);
     normal_distribution<float> norm(0.0f, 1.0f);
@@ -39,7 +34,7 @@ vector<PathData> simulate_paths() {
     return paths;
 }
 
-bool solve_3x3(const float A[3][3], const float B[3], float X[3]) {
+bool solve_3x3_lsm_cpu(const float A[3][3], const float B[3], float X[3]) {
     float det = A[0][0] * (A[1][1]*A[2][2] - A[1][2]*A[2][1])
               - A[0][1] * (A[1][0]*A[2][2] - A[1][2]*A[2][0])
               + A[0][2] * (A[1][0]*A[2][1] - A[1][1]*A[2][0]);
@@ -65,8 +60,8 @@ bool solve_3x3(const float A[3][3], const float B[3], float X[3]) {
     return true;
 }
 
-int main() {
-    vector<PathData> paths = simulate_paths();
+extern "C" void lsm_cpu() {
+    vector<PathData> paths = simulate_paths_lsm_cpu();
     const float discount = expf(-RISKFREE * DT);
 
     // init final cashflows
@@ -106,7 +101,7 @@ int main() {
 
         // coefficients
         float coeff[3];
-        if (!solve_3x3(XtX, XtY, coeff)) {
+        if (!solve_3x3_lsm_cpu(XtX, XtY, coeff)) {
             for (auto& path : paths)
                 path.cashflow *= discount;
             continue;
@@ -136,6 +131,4 @@ int main() {
     for (const auto& path : paths)
         sum += path.cashflow;
     cout << "Swing Option Price: " << sum / NUM_PATHS << endl;
-
-    return 0;
 }

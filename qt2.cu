@@ -3,6 +3,7 @@
 #include <math.h>
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
+#include "qt2.h"
 
 #define NUM_TIMESTEPS 365
 #define NUM_PATHS 100000       // Monte Carlo paths
@@ -16,7 +17,7 @@
 #define MAX_EXERCISE 5
 
 // generate quantization grid
-void generate_grid(float *grid, int size, float mean, float stddev) {
+void generate_grid_qt2(float *grid, int size, float mean, float stddev) {
     for(int i=0; i<size; i++) {
         float u = (i + 0.5f) / size;
         grid[i] = mean + stddev * sqrtf(-2.0f * logf(u)) * cosf(2.0f * M_PI * u);
@@ -24,12 +25,12 @@ void generate_grid(float *grid, int size, float mean, float stddev) {
 }
 
 // GBM
-float grid_to_price(float x, float t) {
+float grid_to_price_qt2(float x, float t) {
     return STRIKE * expf((RISKFREE - 0.5f*SIGMA*SIGMA)*t + SIGMA*x);
 }
 
 // compute transitions and track remaining exercises
-__global__ void compute_transitions(int *d_p_ij, int *d_p_i, float *d_grid, 
+__global__ void compute_transitions_qt2(int *d_p_ij, int *d_p_i, float *d_grid, 
                                    int num_timesteps, int num_paths, int grid_size) {
     int timestep = blockIdx.x;
     int path_idx = threadIdx.x + blockIdx.y * blockDim.x;
@@ -70,19 +71,19 @@ __global__ void compute_transitions(int *d_p_ij, int *d_p_i, float *d_grid,
 }
 
 // backward induction on host
-void backward_induction(float *grid, int *p_ij, int *p_i, float *values) {
+void backward_induction_qt2(float *grid, int *p_ij, int *p_i, float *values) {
     float dt = 1.0f / NUM_TIMESTEPS;
     
     // init final timestep
     for(int i=0; i<NUM_GRID; i++) {
-        float S_T = grid_to_price(grid[(NUM_TIMESTEPS-1)*NUM_GRID + i], 1.0f);
+        float S_T = grid_to_price_qt2(grid[(NUM_TIMESTEPS-1)*NUM_GRID + i], 1.0f);
         values[(NUM_TIMESTEPS-1)*NUM_GRID + i] = fmaxf(S_T - STRIKE, 0.0f);
     }
 
     // backward iteration
     for(int k=NUM_TIMESTEPS-2; k>=0; k--) {
         for(int i=0; i<NUM_GRID; i++) {
-            float immediate = fmaxf(grid_to_price(grid[k*NUM_GRID + i], k*dt) - STRIKE, 0.0f);
+            float immediate = fmaxf(grid_to_price_qt2(grid[k*NUM_GRID + i], k*dt) - STRIKE, 0.0f);
             
             float continuation = 0.0f;
             int total = p_i[k*NUM_GRID + i];
@@ -99,12 +100,12 @@ void backward_induction(float *grid, int *p_ij, int *p_i, float *values) {
     }
 }
 
-int main() {
+extern "C" void qt2() {
     float *h_grid = new float[NUM_TIMESTEPS * NUM_GRID];
     float mean = 0.0f;
     float stddev = SIGMA / sqrtf(1 - ALPHA*ALPHA);
     for(int k=0; k<NUM_TIMESTEPS; k++)
-        generate_grid(h_grid + k*NUM_GRID, NUM_GRID, mean, stddev);
+        generate_grid_qt2(h_grid + k*NUM_GRID, NUM_GRID, mean, stddev);
 
     float *d_grid;
     int *d_p_ij, *d_p_i;
@@ -117,7 +118,7 @@ int main() {
     cudaMemset(d_p_i, 0, NUM_TIMESTEPS * NUM_GRID * sizeof(int));
 
     dim3 grid_dim(NUM_TIMESTEPS, (NUM_PATHS + BLOCK_SIZE-1)/BLOCK_SIZE);
-    compute_transitions<<<grid_dim, BLOCK_SIZE>>>(d_p_ij, d_p_i, d_grid, 
+    compute_transitions_qt2<<<grid_dim, BLOCK_SIZE>>>(d_p_ij, d_p_i, d_grid, 
                                                  NUM_TIMESTEPS, NUM_PATHS, NUM_GRID);
 
     int *h_p_ij = new int[NUM_TIMESTEPS * NUM_GRID * NUM_GRID];
@@ -128,7 +129,7 @@ int main() {
                cudaMemcpyDeviceToHost);
 
     float *h_values = new float[NUM_TIMESTEPS * NUM_GRID];
-    backward_induction(h_grid, h_p_ij, h_p_i, h_values);
+    backward_induction_qt2(h_grid, h_p_ij, h_p_i, h_values);
 
     float price = 0.0f;
     for(int i=0; i<NUM_GRID; i++) 
@@ -138,5 +139,4 @@ int main() {
 
     delete[] h_grid; delete[] h_p_ij; delete[] h_p_i; delete[] h_values;
     cudaFree(d_grid); cudaFree(d_p_ij); cudaFree(d_p_i);
-    return 0;
 }

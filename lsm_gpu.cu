@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 #include <cublas_v2.h>
+#include "lsm_gpu.h"
 
 #define NUM_PATHS 100000    // Monte Carlo paths
 #define NUM_TIMESTEPS 365
@@ -16,7 +17,7 @@
 #define BLOCK_SIZE 256
 
 // GBM
-__global__ void simulate_paths(float *d_paths, int num_timesteps, int num_paths) {
+__global__ void simulate_paths_lsm_gpu(float *d_paths, int num_timesteps, int num_paths) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_paths) return;
 
@@ -33,7 +34,7 @@ __global__ void simulate_paths(float *d_paths, int num_timesteps, int num_paths)
 }
 
 // matrices for regression
-__global__ void compute_xty(float *d_paths, float *d_cashflow, float *d_XtX, float *d_XtY, 
+__global__ void compute_xty_lsm_gpu(float *d_paths, float *d_cashflow, float *d_XtX, float *d_XtY, 
                             int timestep, int num_paths, int num_basis) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_paths) return;
@@ -55,7 +56,7 @@ __global__ void compute_xty(float *d_paths, float *d_cashflow, float *d_XtX, flo
 }
 
 // cashflows and exercise decisions
-__global__ void update_cashflow(float *d_paths, float *d_cashflow, int *d_remaining, 
+__global__ void update_cashflow_lsm_gpu(float *d_paths, float *d_cashflow, int *d_remaining, 
                                 float *d_coeff, int timestep, int num_paths) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_paths) return;
@@ -73,7 +74,7 @@ __global__ void update_cashflow(float *d_paths, float *d_cashflow, int *d_remain
 }
 
 // solve linear system using cuBLAS
-void solve_least_squares(float *h_XtX, float *h_XtY, float *h_coeff) {
+void solve_least_squares_lsm_gpu(float *h_XtX, float *h_XtY, float *h_coeff) {
     cublasHandle_t handle;
     cublasCreate(&handle);
 
@@ -98,7 +99,7 @@ void solve_least_squares(float *h_XtX, float *h_XtY, float *h_coeff) {
     cudaFree(d_XtY);
 }
 
-int main() {
+extern "C" void lsm_gpu() {
     // allocate device
     float *d_paths, *d_cashflow;
     int *d_remaining;
@@ -111,7 +112,7 @@ int main() {
     for (int i = 0; i < NUM_PATHS; ++i) h_remaining[i] = MAX_EXERCISE;
     cudaMemcpy(d_remaining, h_remaining, NUM_PATHS * sizeof(int), cudaMemcpyHostToDevice);
 
-    simulate_paths<<<(NUM_PATHS + BLOCK_SIZE - 1)/BLOCK_SIZE, BLOCK_SIZE>>>
+    simulate_paths_lsm_gpu<<<(NUM_PATHS + BLOCK_SIZE - 1)/BLOCK_SIZE, BLOCK_SIZE>>>
         (d_paths, NUM_TIMESTEPS, NUM_PATHS);
 
     // init final cashflows
@@ -133,7 +134,7 @@ int main() {
         cudaMemset(d_XtY, 0, NUM_BASIS * sizeof(float));
 
         // find X^T X and X^T Y
-        compute_xty<<<(NUM_PATHS + BLOCK_SIZE - 1)/BLOCK_SIZE, BLOCK_SIZE>>>
+        compute_xty_lsm_gpu<<<(NUM_PATHS + BLOCK_SIZE - 1)/BLOCK_SIZE, BLOCK_SIZE>>>
             (d_paths, d_cashflow, d_XtX, d_XtY, t, NUM_PATHS, NUM_BASIS);
 
         // regression coefficients
@@ -143,14 +144,14 @@ int main() {
         cudaMemcpy(h_XtY, d_XtY, NUM_BASIS * sizeof(float), cudaMemcpyDeviceToHost);
 
         float h_coeff[NUM_BASIS] = {0};
-        solve_least_squares(h_XtX, h_XtY, h_coeff);
+        solve_least_squares_lsm_gpu(h_XtX, h_XtY, h_coeff);
 
         // cashflows
         float *d_coeff;
         cudaMalloc(&d_coeff, NUM_BASIS * sizeof(float));
         cudaMemcpy(d_coeff, h_coeff, NUM_BASIS * sizeof(float), cudaMemcpyHostToDevice);
 
-        update_cashflow<<<(NUM_PATHS + BLOCK_SIZE - 1)/BLOCK_SIZE, BLOCK_SIZE>>>
+        update_cashflow_lsm_gpu<<<(NUM_PATHS + BLOCK_SIZE - 1)/BLOCK_SIZE, BLOCK_SIZE>>>
             (d_paths, d_cashflow, d_remaining, d_coeff, t, NUM_PATHS);
 
         cudaFree(d_XtX);
@@ -171,6 +172,4 @@ int main() {
     cudaFree(d_paths);
     cudaFree(d_cashflow);
     cudaFree(d_remaining);
-
-    return 0;
 }
