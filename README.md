@@ -6,16 +6,7 @@
 
 ## Executing the program on our Gateway Server
 
-- **Compile**:
 ```sh
-nvcc -o lsm_cpu lsm_cpu.cu
-```
-```sh
-nvcc -o lsm_gpu lsm_gpu.cu -I/scratch/cuda-samples/Common -lcublas
-```
-```sh
-nvcc -arch=sm_70 -O3 qt2.cu -o qt2 -lcurand
-```
-```sh
-nvcc -arch=sm_70 -O3 qt3.cu -o qt3 -lcurand
+make
+./driver
 ```

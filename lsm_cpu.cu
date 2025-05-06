@@ -16,6 +16,13 @@ const float S0 = 100.0f;
 const int MAX_EXERCISE = 5;
 const float DT = 1.0f / NUM_TIMESTEPS;
 
+unsigned long long total_flops_lsm_cpu(){
+    return 9LL * NUM_PATHS * NUM_TIMESTEPS + 
+            2LL * NUM_PATHS + 
+            NUM_TIMESTEPS * 3LL * NUM_PATHS + 
+            32LL * NUM_PATHS * NUM_TIMESTEPS;
+}
+
 // GBM
 vector<PathData> simulate_paths_lsm_cpu() {
     vector<PathData> paths(NUM_PATHS);

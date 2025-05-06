@@ -1,6 +1,7 @@
 #ifndef LSM_GPU_H
 #define LSM_GPU_H
 
+unsigned long long total_flops_lsm_gpu();
 void solve_least_squares_lsm_gpu(float *h_XtX, float *h_XtY, float *h_coeff);
 extern "C" void lsm_gpu();
 

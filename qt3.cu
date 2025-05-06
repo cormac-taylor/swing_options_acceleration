@@ -7,12 +7,17 @@
 
 #define NUM_TIMESTEPS 365
 #define NUM_PATHS 100000       // Monte Carlo paths
-#define NUM_GRID 900           // grid size per timestep
+#define NUM_GRID 500           // grid size per timestep
 #define BLOCK_SIZE 256
 #define ALPHA 0.1f             // AR(1) coefficient
 #define SIGMA 0.2f             // volatility
 #define STRIKE 100.0f
 #define RISKFREE 0.05f         // risk-free rate
+
+unsigned long long total_flops_qt3(){
+    return (1LL * NUM_PATHS * NUM_TIMESTEPS * (NUM_TIMESTEPS + 4 * NUM_GRID)) +
+            (8LL * NUM_GRID + 1LL * NUM_TIMESTEPS * NUM_GRID * 2 * NUM_GRID);
+}
 
 // generate quantization grid
 void generate_grid_qt3(float *grid, int size, float mean, float stddev) {

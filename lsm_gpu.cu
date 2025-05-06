@@ -5,6 +5,7 @@
 #include <curand_kernel.h>
 #include <cublas_v2.h>
 #include "lsm_gpu.h"
+#include <cusolverDn.h>
 
 #define NUM_PATHS 100000    // Monte Carlo paths
 #define NUM_TIMESTEPS 365
@@ -15,6 +16,13 @@
 #define S0 100.0f           // initial asset price
 #define MAX_EXERCISE 5
 #define BLOCK_SIZE 256
+
+unsigned long long total_flops_lsm_gpu(){
+    return 9LL * NUM_PATHS * NUM_TIMESTEPS + 
+            2LL * NUM_PATHS + 
+            NUM_TIMESTEPS * 3LL * NUM_PATHS + 
+            32LL * NUM_PATHS * NUM_TIMESTEPS;
+}
 
 // GBM
 __global__ void simulate_paths_lsm_gpu(float *d_paths, int num_timesteps, int num_paths) {
@@ -73,32 +81,50 @@ __global__ void update_cashflow_lsm_gpu(float *d_paths, float *d_cashflow, int *
     }
 }
 
-// solve linear system using cuBLAS
 void solve_least_squares_lsm_gpu(float *h_XtX, float *h_XtY, float *h_coeff) {
-    cublasHandle_t handle;
-    cublasCreate(&handle);
+    cusolverDnHandle_t handle;
+    cusolverDnCreate(&handle);
 
     float *d_XtX, *d_XtY;
     cudaMalloc(&d_XtX, NUM_BASIS * NUM_BASIS * sizeof(float));
     cudaMalloc(&d_XtY, NUM_BASIS * sizeof(float));
-    
     cudaMemcpy(d_XtX, h_XtX, NUM_BASIS * NUM_BASIS * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_XtY, h_XtY, NUM_BASIS * sizeof(float), cudaMemcpyHostToDevice);
 
-    int info;
-    int *d_info;
+    // LU decomposition
+    int Lwork;
+    cusolverDnSgetrf_bufferSize(handle, NUM_BASIS, NUM_BASIS, d_XtX, NUM_BASIS, &Lwork);
+    float *d_work;
+    cudaMalloc(&d_work, Lwork * sizeof(float));
+
+    int *d_pivot, *d_info;
+    cudaMalloc(&d_pivot, NUM_BASIS * sizeof(int));
     cudaMalloc(&d_info, sizeof(int));
-    cublasSgetrfBatched(handle, NUM_BASIS, &d_XtX, NUM_BASIS, NULL, &info, 1);
-    cublasSgetrsBatched(handle, CUBLAS_OP_N, NUM_BASIS, 1, &d_XtX, NUM_BASIS, 
-                        NULL, &d_XtY, NUM_BASIS, &info, 1);
+
+    cusolverDnSgetrf(handle, NUM_BASIS, NUM_BASIS, d_XtX, NUM_BASIS, d_work, d_pivot, d_info);
+
+    // check success
+    int info;
+    cudaMemcpy(&info, d_info, sizeof(int), cudaMemcpyDeviceToHost);
+    if (info != 0) {
+        fprintf(stderr, "LU decomposition failed: %d\n", info);
+        exit(1);
+    }
+
+    // XtX * coeff = XtY
+    cusolverDnSgetrs(handle, CUBLAS_OP_N, NUM_BASIS, 1, d_XtX, NUM_BASIS, d_pivot, d_XtY, NUM_BASIS, d_info);
 
     cudaMemcpy(h_coeff, d_XtY, NUM_BASIS * sizeof(float), cudaMemcpyDeviceToHost);
 
-    cublasDestroy(handle);
+    cusolverDnDestroy(handle);
     cudaFree(d_XtX);
     cudaFree(d_XtY);
+    cudaFree(d_work);
+    cudaFree(d_pivot);
+    cudaFree(d_info);
 }
 
+// int main
 extern "C" void lsm_gpu() {
     // allocate device
     float *d_paths, *d_cashflow;
@@ -172,4 +198,6 @@ extern "C" void lsm_gpu() {
     cudaFree(d_paths);
     cudaFree(d_cashflow);
     cudaFree(d_remaining);
+
+    // return 0;
 }
